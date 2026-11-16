@@ -5,6 +5,14 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 This document follows
 [markdownlint](https://github.com/markdownlint/markdownlint) formatting rules.
 
+## [Unreleased]
+
+### Added in Unreleased
+
+- Add a dictionary encoded Categorical Series type with fixed level domains and ordered levels
+- Preserve Categorical level domains through GroupBy, Aggregation, joins, RBind and Concat
+- Load Categorical columns from records with `WithCategoricals` and `WithCategoricalLevels`
+
 ## [0.12.0] - 2021-10-10
 
 ### Added in 0.12.0

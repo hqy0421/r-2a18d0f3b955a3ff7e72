@@ -118,6 +118,13 @@ const (
 	Int    Type = "int"
 	Float  Type = "float"
 	Bool   Type = "bool"
+	// Categorical is a dictionary encoded string type meant for low cardinality
+	// columns. Values are stored as integer codes into a column level
+	// dictionary, which can optionally declare a fixed domain and an ordering
+	// for its levels.
+	Categorical Type = "categorical"
+	// Category is an alias for Categorical.
+	Category Type = "categorical"
 )
 
 // Indexes represent the elements that can be used for selecting a subset of
@@ -148,6 +155,8 @@ func New(values interface{}, t Type, name string) Series {
 			ret.elements = make(floatElements, n)
 		case Bool:
 			ret.elements = make(boolElements, n)
+		case Categorical:
+			ret.elements = newCategoryElements(n, nil)
 		default:
 			panic(fmt.Sprintf("unknown type %v", t))
 		}
@@ -156,6 +165,9 @@ func New(values interface{}, t Type, name string) Series {
 	if values == nil {
 		preAlloc(1)
 		ret.elements.Elem(0).Set(nil)
+		if ce, ok := ret.elements.(*categoryElements); ok {
+			ce.sortInferred()
+		}
 		return ret
 	}
 
@@ -186,6 +198,18 @@ func New(values interface{}, t Type, name string) Series {
 		}
 	case Series:
 		l := v.Len()
+		if src, ok := v.elements.(*categoryElements); ok && t == Categorical {
+			ce := newCategoryElements(l, src.dict.clone())
+			for i, elem := range src.elements {
+				code := elem.code
+				if _, ok := elem.label(); !ok {
+					code = -1
+				}
+				ce.elements[i] = categoryElement{code: code, dict: ce.dict}
+			}
+			ret.elements = ce
+			break
+		}
 		preAlloc(l)
 		for i := 0; i < l; i++ {
 			ret.elements.Elem(i).Set(v.elements.Elem(i))
@@ -206,6 +230,10 @@ func New(values interface{}, t Type, name string) Series {
 			val := v.Interface()
 			ret.elements.Elem(0).Set(val)
 		}
+	}
+
+	if ce, ok := ret.elements.(*categoryElements); ok {
+		ce.sortInferred()
 	}
 
 	return ret
@@ -233,7 +261,50 @@ func Bools(values interface{}) Series {
 
 // Empty returns an empty Series of the same type
 func (s Series) Empty() Series {
+	if ce, ok := s.elements.(*categoryElements); ok {
+		ret := Series{Name: s.Name, t: Categorical}
+		ret.elements = newCategoryElements(0, ce.dict.clone())
+		return ret
+	}
 	return New([]int{}, s.t, s.Name)
+}
+
+// CategoricalSpec returns the level domain and ordering of a Categorical
+// Series. It returns false for non categorical Series.
+func (s Series) CategoricalSpec() (CategoricalSpec, bool) {
+	ce, ok := s.elements.(*categoryElements)
+	if !ok || ce.dict == nil {
+		return CategoricalSpec{}, false
+	}
+	return CategoricalSpec{
+		Levels:  append([]string{}, ce.dict.labels...),
+		Ordered: ce.dict.ordered,
+		Fixed:   ce.dict.fixed,
+	}, true
+}
+
+// Levels returns the ordered level labels of a Categorical Series. It returns
+// nil for non categorical Series.
+func (s Series) Levels() []string {
+	spec, ok := s.CategoricalSpec()
+	if !ok {
+		return nil
+	}
+	return spec.Levels
+}
+
+// IsOrdered returns whether the levels of a Categorical Series are ordered. It
+// returns false for non categorical Series.
+func (s Series) IsOrdered() bool {
+	spec, ok := s.CategoricalSpec()
+	return ok && spec.Ordered
+}
+
+// HasFixedLevels returns whether a Categorical Series has a fixed level
+// domain. It returns false for non categorical Series.
+func (s Series) HasFixedLevels() bool {
+	spec, ok := s.CategoricalSpec()
+	return ok && spec.Fixed
 }
 
 // Returns Error or nil if no error occured
@@ -247,7 +318,14 @@ func (s *Series) Append(values interface{}) {
 	if err := s.Err; err != nil {
 		return
 	}
+	var srcElements Elements
+	if x, ok := values.(Series); ok && x.t == s.t {
+		srcElements = x.elements
+	}
 	news := New(values, s.t, s.Name)
+	if srcElements != nil {
+		news.elements = srcElements
+	}
 	switch s.t {
 	case String:
 		s.elements = append(s.elements.(stringElements), news.elements.(stringElements)...)
@@ -257,11 +335,22 @@ func (s *Series) Append(values interface{}) {
 		s.elements = append(s.elements.(floatElements), news.elements.(floatElements)...)
 	case Bool:
 		s.elements = append(s.elements.(boolElements), news.elements.(boolElements)...)
+	case Categorical:
+		// Appending converts the values to a Categorical column and then merges
+		// its level dictionary. Labels outside a fixed domain are recorded as
+		// missing by that merge instead of extending the domain.
+		dst := s.elements.(*categoryElements)
+		src := news.elements.(*categoryElements)
+		if err := appendCategorical(dst, src); err != nil {
+			s.Err = err
+		}
 	}
 }
 
 // Concat concatenates two series together. It will return a new Series with the
-// combined elements of both Series.
+// combined elements of both Series. For Categorical Series the level domains of
+// both sides are merged so that no declared level is lost and equal labels keep
+// matching even when the two columns used different encodings.
 func (s Series) Concat(x Series) Series {
 	if err := s.Err; err != nil {
 		return s
@@ -269,6 +358,14 @@ func (s Series) Concat(x Series) Series {
 	if err := x.Err; err != nil {
 		s.Err = fmt.Errorf("concat error: argument has errors: %v", err)
 		return s
+	}
+	if s.t == Categorical && x.t == Categorical {
+		y := s.Copy()
+		if err := appendCategoricalWithMode(y.elements.(*categoryElements), x.elements.(*categoryElements), true); err != nil {
+			y.Err = err
+			return y
+		}
+		return y
 	}
 	y := s.Copy()
 	y.Append(x)
@@ -312,6 +409,16 @@ func (s Series) Subset(indexes Indexes) Series {
 		elements := make(boolElements, len(idx))
 		for k, i := range idx {
 			elements[k] = s.elements.(boolElements)[i]
+		}
+		ret.elements = elements
+	case Categorical:
+		src := s.elements.(*categoryElements)
+		elements := newCategoryElements(len(idx), src.dict.clone())
+		for k, i := range idx {
+			elem := src.elements[i]
+			if _, ok := elem.label(); ok {
+				elements.elements[k] = categoryElement{code: elem.code, dict: elements.dict}
+			}
 		}
 		ret.elements = elements
 	default:
@@ -490,6 +597,16 @@ func (s Series) Copy() Series {
 	case Int:
 		elements = make(intElements, s.Len())
 		copy(elements.(intElements), s.elements.(intElements))
+	case Categorical:
+		src := s.elements.(*categoryElements)
+		elements = newCategoryElements(s.Len(), src.dict.clone())
+		for i, elem := range src.elements {
+			code := elem.code
+			if _, ok := elem.label(); !ok {
+				code = -1
+			}
+			elements.(*categoryElements).elements[i] = categoryElement{code: code, dict: elements.(*categoryElements).dict}
+		}
 	}
 	ret := Series{
 		Name:     name,
@@ -693,7 +810,8 @@ func (s Series) Mean() float64 {
 func (s Series) Median() float64 {
 	if s.elements.Len() == 0 ||
 		s.Type() == String ||
-		s.Type() == Bool {
+		s.Type() == Bool ||
+		s.Type() == Categorical {
 		return math.NaN()
 	}
 	ix := s.Order(false)
@@ -716,7 +834,7 @@ func (s Series) Median() float64 {
 
 // Max return the biggest element in the series
 func (s Series) Max() float64 {
-	if s.elements.Len() == 0 || s.Type() == String {
+	if s.elements.Len() == 0 || s.Type() == String || s.Type() == Categorical {
 		return math.NaN()
 	}
 
@@ -732,7 +850,7 @@ func (s Series) Max() float64 {
 
 // MaxStr return the biggest element in a series of type String
 func (s Series) MaxStr() string {
-	if s.elements.Len() == 0 || s.Type() != String {
+	if s.elements.Len() == 0 || (s.Type() != String && s.Type() != Categorical) {
 		return ""
 	}
 
@@ -748,7 +866,7 @@ func (s Series) MaxStr() string {
 
 // Min return the lowest element in the series
 func (s Series) Min() float64 {
-	if s.elements.Len() == 0 || s.Type() == String {
+	if s.elements.Len() == 0 || s.Type() == String || s.Type() == Categorical {
 		return math.NaN()
 	}
 
@@ -764,7 +882,7 @@ func (s Series) Min() float64 {
 
 // MinStr return the lowest element in a series of type String
 func (s Series) MinStr() string {
-	if s.elements.Len() == 0 || s.Type() != String {
+	if s.elements.Len() == 0 || (s.Type() != String && s.Type() != Categorical) {
 		return ""
 	}
 
@@ -782,7 +900,7 @@ func (s Series) MinStr() string {
 // equal to the fraction p of samples.
 // Note: gonum/stat panics when called with strings
 func (s Series) Quantile(p float64) float64 {
-	if s.Type() == String || s.Len() == 0 {
+	if s.Type() == String || s.Type() == Categorical || s.Len() == 0 {
 		return math.NaN()
 	}
 
@@ -804,12 +922,21 @@ func (s Series) Map(f MapFunction) Series {
 		value := f(s.elements.Elem(i))
 		mappedValues[i] = value
 	}
-	return New(mappedValues, s.Type(), s.Name)
+	ret := New(mappedValues, s.Type(), s.Name)
+	if ce, ok := s.elements.(*categoryElements); ok {
+		if mapped, ok := ret.elements.(*categoryElements); ok && ce.dict != nil {
+			// Keep the level domain and ordering of the source column; mapped
+			// labels outside of a fixed domain become missing.
+			conformed := conformCategorical(mapped, ce.dict)
+			ret.elements = conformed
+		}
+	}
+	return ret
 }
 
 // Sum calculates the sum value of a series
 func (s Series) Sum() float64 {
-	if s.elements.Len() == 0 || s.Type() == String || s.Type() == Bool {
+	if s.elements.Len() == 0 || s.Type() == String || s.Type() == Bool || s.Type() == Categorical {
 		return math.NaN()
 	}
 	sFloat := s.Float()

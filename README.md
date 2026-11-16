@@ -409,13 +409,65 @@ Series are essentially vectors of elements of the same type with
 support for missing values. Series are the building blocks for
 DataFrame columns.
 
-Four types are currently supported:
+Five types are currently supported:
 
 ```go
 Int
 Float
 String
 Bool
+Categorical
+```
+
+### Categorical columns
+
+`Categorical` is a dictionary encoded string type intended for low cardinality
+dimension columns. Instead of storing a full string per row, each element holds
+an integer code into a column level dictionary, so repeated labels cost one
+integer per row. The level dictionary can declare a fixed domain and an
+explicit order, which lets business ranks be sorted without relying on
+alphabetical order:
+
+```go
+// Levels are ordered by business rank, not alphabetically.
+grades := series.NewCategorical(
+    []string{"medium", "low", "high", "medium"},
+    "grade",
+    series.WithLevels("low", "medium", "high"),
+    series.WithOrdered(true),
+)
+grades.Records() // [medium low high medium]
+grades.Levels()  // [low medium high]
+grades.Codes()   // [1 0 2 1]
+```
+
+Key behaviours:
+
+- Labels are compared by label, never by code, so two columns that encode the
+  same labels differently still match in filters and joins.
+- Levels declared with `WithLevels` form a fixed domain by default. Assigning a
+  value outside of it stores a missing value instead of extending the domain.
+  Use `series.WithFixed(false)` for an open domain that grows on assignment.
+- Ordered categoricals sort and compare by level rank; unordered ones sort
+  lexicographically.
+- `Subset`, `Copy`, `Concat`, `RBind`, joins and `GroupBy`/`Aggregation` keep the
+  level domain, including levels that appear in no row. Concatenating two
+  ordered categoricals with incompatible level orders returns an error.
+- CSV and JSON exports print the labels rather than the integer codes.
+
+When loading from `[][]string`, declare the columns to encode:
+
+```go
+df := dataframe.LoadRecords(
+    [][]string{
+        {"grade", "value"},
+        {"low", "1"},
+        {"medium", "2"},
+    },
+    dataframe.WithCategoricals(map[string]series.CategoricalSpec{
+        "grade": {Levels: []string{"low", "medium", "high"}, Ordered: true, Fixed: true},
+    }),
+)
 ```
 
 For more information about the API, make sure to check:

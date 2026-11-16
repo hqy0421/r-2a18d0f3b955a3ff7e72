@@ -387,48 +387,47 @@ func (df DataFrame) GroupBy(colnames ...string) *Groups {
 	if len(colnames) <= 0 {
 		return nil
 	}
-	groupDataFrame := make(map[string]DataFrame)
-	groupSeries := make(map[string][]map[string]interface{})
 	// Check that colname exist on dataframe
 	for _, c := range colnames {
 		if idx := findInStringSlice(c, df.Names()); idx == -1 {
 			return &Groups{Err: fmt.Errorf("GroupBy: can't find column name: %s", c)}
 		}
 	}
-
-	for _, s := range df.Maps() {
+	groupIndexes := make(map[string][]int)
+	for i := 0; i < df.nrows; i++ {
 		// Gen Key for per Series
 		key := ""
-		for i, c := range colnames {
-			format := ""
-			if i == 0 {
-				format = "%s%"
-			} else {
-				format = "%s_%"
-			}
-			switch s[c].(type) {
-			case string, bool:
-				format += "s"
-			case int, int16, int32, int64:
-				format += "d"
-			case float32, float64:
-				format += "f"
+		for j, c := range colnames {
+			elem := df.columns[findInStringSlice(c, df.Names())].Elem(i)
+			var token string
+			switch elem.Type() {
+			case series.String, series.Bool, series.Categorical:
+				token = elem.String()
+			case series.Int:
+				v, err := elem.Int()
+				if err != nil {
+					return &Groups{Err: fmt.Errorf("GroupBy: type not found")}
+				}
+				token = strconv.Itoa(v)
+			case series.Float:
+				token = fmt.Sprintf("%f", elem.Float())
 			default:
 				return &Groups{Err: fmt.Errorf("GroupBy: type not found")}
 			}
-			key = fmt.Sprintf(format, key, s[c])
+			if j == 0 {
+				key = token
+			} else {
+				key = key + "_" + token
+			}
 		}
-		groupSeries[key] = append(groupSeries[key], s)
+		groupIndexes[key] = append(groupIndexes[key], i)
 	}
 
-	// Save column types
-	colTypes := map[string]series.Type{}
-	for _, c := range df.columns {
-		colTypes[c.Name] = c.Type()
-	}
-
-	for k, cMaps := range groupSeries {
-		groupDataFrame[k] = LoadMaps(cMaps, WithTypes(colTypes))
+	// Build the groups by subsetting the original DataFrame so that column
+	// types, categorical level domains and orderings are preserved.
+	groupDataFrame := make(map[string]DataFrame, len(groupIndexes))
+	for k, idx := range groupIndexes {
+		groupDataFrame[k] = df.Subset(idx)
 	}
 	groups := &Groups{groups: groupDataFrame, colnames: colnames}
 	return groups
@@ -464,21 +463,84 @@ func (gps Groups) Aggregation(typs []AggregationType, colnames []string) DataFra
 	if len(typs) != len(colnames) {
 		return DataFrame{Err: fmt.Errorf("Aggregation: len(typs) != len(colanmes)")}
 	}
-	dfMaps := make([]map[string]interface{}, 0)
-	for _, df := range gps.groups {
-		targetMap := df.Maps()[0]
-		curMap := make(map[string]interface{})
-		// add columns of  group by
+
+	// Deterministic group order: sort by the typed comparison of the key
+	// elements, so that ordered categorical keys follow their level order
+	// instead of the lexicographic order of the encoded key strings.
+	keys := make([]string, 0, len(gps.groups))
+	for k := range gps.groups {
+		keys = append(keys, k)
+	}
+	keyLess := func(a, b DataFrame) bool {
 		for _, c := range gps.colnames {
-			if value, ok := targetMap[c]; ok {
-				curMap[c] = value
-			} else {
-				return DataFrame{Err: fmt.Errorf("Aggregation: can't find column name: %s", c)}
+			ia := a.colIndex(c)
+			ib := b.colIndex(c)
+			if ia == -1 || ib == -1 {
+				return false
+			}
+			ea := a.columns[ia].Elem(0)
+			eb := b.columns[ib].Elem(0)
+			if ea.Less(eb) {
+				return true
+			}
+			if eb.Less(ea) {
+				return false
 			}
 		}
-		// Aggregation
+		return false
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		a, b := gps.groups[keys[i]], gps.groups[keys[j]]
+		if keyLess(a, b) {
+			return true
+		}
+		if keyLess(b, a) {
+			return false
+		}
+		// Ties (for example missing keys, which never compare less) fall back
+		// to the key string so that the output order is deterministic.
+		return keys[i] < keys[j]
+	})
+
+	var groupCols []series.Series
+	var aggCols []series.Series
+
+	for _, k := range keys {
+		df := gps.groups[k]
+		if df.Err != nil {
+			return DataFrame{Err: df.Err}
+		}
+		row := df.nrows
+		if row == 0 {
+			return DataFrame{Err: fmt.Errorf("Aggregation: empty group")}
+		}
+		for i, c := range gps.colnames {
+			if c == "" {
+				return DataFrame{Err: fmt.Errorf("Aggregation: can't find column name: %s", c)}
+			}
+			idx := df.colIndex(c)
+			if idx == -1 {
+				// The group was created by GroupBy and must contain the key.
+				return DataFrame{Err: fmt.Errorf("Aggregation: can't find column name: %s", c)}
+			}
+			if i >= len(groupCols) {
+				groupCols = append(groupCols, df.columns[idx].Empty())
+			}
+			groupCols[i].Append(df.columns[idx].Elem(0))
+			if err := groupCols[i].Err; err != nil {
+				return DataFrame{Err: fmt.Errorf("Aggregation: %v", err)}
+			}
+		}
 		for i, c := range colnames {
-			curSeries := df.Col(c)
+			idx := df.colIndex(c)
+			if idx == -1 {
+				return DataFrame{Err: fmt.Errorf("Aggregation: can't find column name: %s", c)}
+			}
+			if len(aggCols) <= i {
+				aggCols = append(aggCols, series.Floats(nil).Empty())
+				aggCols[i].Name = fmt.Sprintf("%s_%s", c, typs[i])
+			}
+			curSeries := df.columns[idx]
 			var value float64
 			switch typs[i] {
 			case Aggregation_MAX:
@@ -497,30 +559,13 @@ func (gps Groups) Aggregation(typs []AggregationType, colnames []string) DataFra
 				value = float64(curSeries.Len())
 			default:
 				return DataFrame{Err: fmt.Errorf("Aggregation: this method %s not found", typs[i])}
-
 			}
-			curMap[fmt.Sprintf("%s_%s", c, typs[i])] = value
-		}
-		dfMaps = append(dfMaps, curMap)
-
-	}
-
-	// Save column types
-	colTypes := map[string]series.Type{}
-	for k := range dfMaps[0] {
-		switch dfMaps[0][k].(type) {
-		case string:
-			colTypes[k] = series.String
-		case int, int16, int32, int64:
-			colTypes[k] = series.Int
-		case float32, float64:
-			colTypes[k] = series.Float
-		default:
-			continue
+			aggCols[i].Append(value)
 		}
 	}
 
-	gps.aggregation = LoadMaps(dfMaps, WithTypes(colTypes))
+	all := append(append([]series.Series{}, groupCols...), aggCols...)
+	gps.aggregation = New(all...)
 	return gps.aggregation
 }
 
@@ -617,12 +662,12 @@ func (df DataFrame) Concat(dfb DataFrame) DataFrame {
 			a = df.columns[aidx]
 		} else {
 			bb := dfb.columns[bidx]
-			a = series.New(make([]struct{}, df.nrows), bb.Type(), bb.Name)
+			a = missingColumn(df.nrows, bb)
 		}
 		if bidx != -1 {
 			b = dfb.columns[bidx]
 		} else {
-			b = series.New(make([]struct{}, dfb.nrows), a.Type(), a.Name)
+			b = missingColumn(dfb.nrows, a)
 		}
 		newSeries := a.Concat(b)
 		if err := newSeries.Err; err != nil {
@@ -631,6 +676,17 @@ func (df DataFrame) Concat(dfb DataFrame) DataFrame {
 		expandedSeries[k] = newSeries
 	}
 	return New(expandedSeries...)
+}
+
+// missingColumn returns a Series of the given length full of missing values
+// that keeps the type and, for categorical columns, the full level domain of
+// the given reference column.
+func missingColumn(n int, ref series.Series) series.Series {
+	col := series.New(make([]struct{}, n), ref.Type(), ref.Name)
+	if _, ok := ref.CategoricalSpec(); ok {
+		col = col.MergeLevels(ref)
+	}
+	return col
 }
 
 // Mutate changes a column of the DataFrame with the given Series or adds it as
@@ -842,7 +898,7 @@ func (df DataFrame) Rapply(f func(series.Series) series.Series) DataFrame {
 		var hasStrings, hasFloats, hasInts, hasBools bool
 		for _, t := range types {
 			switch t {
-			case series.String:
+			case series.String, series.Categorical:
 				hasStrings = true
 			case series.Float:
 				hasFloats = true
@@ -962,6 +1018,10 @@ type loadOptions struct {
 
 	// The types of specific columns can be specified via column name.
 	types map[string]series.Type
+
+	// The categorical level domains of specific columns can be specified via
+	// column name.
+	categoricals map[string]series.CategoricalSpec
 }
 
 // DefaultType sets the defaultType option for loadOptions.
@@ -1003,6 +1063,32 @@ func NaNValues(nanValues []string) LoadOption {
 func WithTypes(coltypes map[string]series.Type) LoadOption {
 	return func(c *loadOptions) {
 		c.types = coltypes
+	}
+}
+
+// WithCategoricals sets the categorical level domains of specific columns. A
+// column is loaded as categorical only when it is declared here or when its
+// type is set to series.Categorical via WithTypes.
+func WithCategoricals(specs map[string]series.CategoricalSpec) LoadOption {
+	return func(c *loadOptions) {
+		c.categoricals = specs
+	}
+}
+
+// WithCategoricalLevels declares the ordered levels of specific columns,
+// loading them as categorical columns.
+func WithCategoricalLevels(levels map[string][]string) LoadOption {
+	return func(c *loadOptions) {
+		if c.categoricals == nil {
+			c.categoricals = make(map[string]series.CategoricalSpec, len(levels))
+		}
+		for name, lvls := range levels {
+			c.categoricals[name] = series.CategoricalSpec{
+				Levels:  lvls,
+				Ordered: true,
+				Fixed:   true,
+			}
+		}
 	}
 }
 
@@ -1149,6 +1235,13 @@ func LoadStructs(i interface{}, options ...LoadOption) DataFrame {
 				}
 			}
 
+			// A declared categorical column is always encoded as categorical,
+			// even when its Go field type is a string.
+			spec, isCategorical := cfg.categoricals[fieldName]
+			if isCategorical {
+				t = series.Categorical
+			}
+
 			// Handle `hasHeader` option
 			if !cfg.hasHeader {
 				tmp := make([]interface{}, 1)
@@ -1156,7 +1249,14 @@ func LoadStructs(i interface{}, options ...LoadOption) DataFrame {
 				elements = append(tmp, elements...)
 				fieldName = ""
 			}
-			columns = append(columns, series.New(elements, t, fieldName))
+			col := series.New(elements, t, fieldName)
+			if isCategorical {
+				col = col.WithCategoricalSpec(spec)
+			}
+			if col.Err != nil {
+				return DataFrame{Err: col.Err}
+			}
+			columns = append(columns, col)
 		}
 		return New(columns...)
 	}
@@ -1174,6 +1274,8 @@ func parseType(s string) (series.Type, error) {
 		return series.String, nil
 	case "bool":
 		return series.Bool, nil
+	case "categorical", "category", "factor":
+		return series.Categorical, nil
 	}
 	return "", fmt.Errorf("type (%s) is not supported", s)
 }
@@ -1217,6 +1319,7 @@ func LoadRecords(records [][]string, options ...LoadOption) DataFrame {
 	}
 
 	types := make([]series.Type, len(headers))
+	specs := make([]*series.CategoricalSpec, len(headers))
 	rawcols := make([][]string, len(headers))
 	for i, colname := range headers {
 		rawcol := make([]string, len(records))
@@ -1227,6 +1330,13 @@ func LoadRecords(records [][]string, options ...LoadOption) DataFrame {
 			}
 		}
 		rawcols[i] = rawcol
+
+		if spec, ok := cfg.categoricals[colname]; ok {
+			s := spec
+			specs[i] = &s
+			types[i] = series.Categorical
+			continue
+		}
 
 		t, ok := cfg.types[colname]
 		if !ok {
@@ -1242,7 +1352,13 @@ func LoadRecords(records [][]string, options ...LoadOption) DataFrame {
 
 	columns := make([]series.Series, len(headers))
 	for i, colname := range headers {
-		col := series.New(rawcols[i], types[i], colname)
+		var col series.Series
+		if specs[i] != nil {
+			col = series.NewCategorical(rawcols[i], colname)
+			col = col.WithCategoricalSpec(*specs[i])
+		} else {
+			col = series.New(rawcols[i], types[i], colname)
+		}
 		if col.Err != nil {
 			return DataFrame{Err: col.Err}
 		}
@@ -1609,6 +1725,21 @@ func (df DataFrame) Col(colname string) series.Series {
 	return df.columns[idx].Copy()
 }
 
+// mergedEmptyColumn returns an empty copy of a column, with the level domain
+// merged with the levels of an optional counterpart. It is used to build the
+// columns of join results while preserving categorical level domains that do
+// not appear in any output row.
+func mergedEmptyColumn(primary series.Series, other ...series.Series) series.Series {
+	col := primary.Empty()
+	for _, o := range other {
+		if len(o.Levels()) == 0 && !o.HasFixedLevels() {
+			continue
+		}
+		col = col.MergeLevels(o)
+	}
+	return col
+}
+
 // InnerJoin returns a DataFrame containing the inner join of two DataFrames.
 func (df DataFrame) InnerJoin(b DataFrame, keys ...string) DataFrame {
 	if len(keys) == 0 {
@@ -1636,10 +1767,12 @@ func (df DataFrame) InnerJoin(b DataFrame, keys ...string) DataFrame {
 
 	aCols := df.columns
 	bCols := b.columns
-	// Initialize newCols
+	// Initialize newCols. Empty columns inherit the full level domain of
+	// every column they are built from, so categorical levels that do not
+	// show up in the joined rows are preserved.
 	var newCols []series.Series
-	for _, i := range iKeysA {
-		newCols = append(newCols, aCols[i].Empty())
+	for k := range iKeysA {
+		newCols = append(newCols, mergedEmptyColumn(aCols[iKeysA[k]], bCols[iKeysB[k]]))
 	}
 	var iNotKeysA []int
 	for i := 0; i < df.ncols; i++ {
@@ -1715,10 +1848,12 @@ func (df DataFrame) LeftJoin(b DataFrame, keys ...string) DataFrame {
 
 	aCols := df.columns
 	bCols := b.columns
-	// Initialize newCols
+	// Initialize newCols. Empty columns inherit the full level domain of
+	// every column they are built from, so categorical levels that do not
+	// show up in the joined rows are preserved.
 	var newCols []series.Series
-	for _, i := range iKeysA {
-		newCols = append(newCols, aCols[i].Empty())
+	for k := range iKeysA {
+		newCols = append(newCols, mergedEmptyColumn(aCols[iKeysA[k]], bCols[iKeysB[k]]))
 	}
 	var iNotKeysA []int
 	for i := 0; i < df.ncols; i++ {
@@ -1813,10 +1948,12 @@ func (df DataFrame) RightJoin(b DataFrame, keys ...string) DataFrame {
 
 	aCols := df.columns
 	bCols := b.columns
-	// Initialize newCols
+	// Initialize newCols. Empty columns inherit the full level domain of
+	// every column they are built from, so categorical levels that do not
+	// show up in the joined rows are preserved.
 	var newCols []series.Series
-	for _, i := range iKeysA {
-		newCols = append(newCols, aCols[i].Empty())
+	for k := range iKeysA {
+		newCols = append(newCols, mergedEmptyColumn(aCols[iKeysA[k]], bCols[iKeysB[k]]))
 	}
 	var iNotKeysA []int
 	for i := 0; i < df.ncols; i++ {
@@ -1921,10 +2058,12 @@ func (df DataFrame) OuterJoin(b DataFrame, keys ...string) DataFrame {
 
 	aCols := df.columns
 	bCols := b.columns
-	// Initialize newCols
+	// Initialize newCols. Empty columns inherit the full level domain of
+	// every column they are built from, so categorical levels that do not
+	// show up in the joined rows are preserved.
 	var newCols []series.Series
-	for _, i := range iKeysA {
-		newCols = append(newCols, aCols[i].Empty())
+	for k := range iKeysA {
+		newCols = append(newCols, mergedEmptyColumn(aCols[iKeysA[k]], bCols[iKeysB[k]]))
 	}
 	var iNotKeysA []int
 	for i := 0; i < df.ncols; i++ {
@@ -2220,7 +2359,7 @@ func parseSelectIndexes(l int, indexes SelectIndexes, colnames []string) ([]int,
 				return nil, fmt.Errorf("indexing error: %v", err)
 			}
 			return parseSelectIndexes(l, bools, colnames)
-		case series.String:
+		case series.String, series.Categorical:
 			xs := indexes.(series.Series).Records()
 			return parseSelectIndexes(l, xs, colnames)
 		default:
@@ -2318,7 +2457,10 @@ func (df DataFrame) Describe() DataFrame {
 	for _, col := range df.columns {
 		var newCol series.Series
 		switch col.Type() {
-		case series.String:
+		case series.String, series.Categorical:
+			// Summary statistics are plain strings, even for a Categorical
+			// column, so that its numeric slots ("-") are not encoded as
+			// categories.
 			newCol = series.New([]string{
 				"-",
 				"-",
@@ -2329,7 +2471,7 @@ func (df DataFrame) Describe() DataFrame {
 				"-",
 				col.MaxStr(),
 			},
-				col.Type(),
+				series.String,
 				col.Name,
 			)
 		case series.Bool:
